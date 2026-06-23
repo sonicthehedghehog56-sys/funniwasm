@@ -1,2 +1,2 @@
 # funniwasm
-a port of https://github.com/diekmann/wasm-fizzbuzz to roblox using https://github.com/SovereignSatellite/Wasynth (IM SUPER SORRY IF THE README IS BAD IDK HOW TO MAKE READMES THIS IS MY FIRST PUBLIC GITHUB REPO)
+a port of https://github.com/diekmann/wasm-fizzbuzz to roblox using https://github.com/SovereignSatellite/Wasynth this uses editableimages and has SOME (pretty broken) audio support mainly sound effects (yes ik my code sucks) im gonna give a warning the DOOM modulescript is LOOOOOOOONNNNGGGG and will most likely lag your device (it lags mine) yes i know wasynth was superseded by spider.
