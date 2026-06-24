@@ -1,3 +1,4 @@
+--!native
 -- DOOM Runner with EditableImage Display Backend + Sound Interception
 -- Replaces the js_draw_screen framebuffer mechanism with
 -- AssetService:CreateEditableImage + WritePixelsBuffer
@@ -242,12 +243,29 @@ local part = Instance.new("Part") part.Parent = workspace part.Size = Vector3.ne
 -- Constants for the DOOM framebuffer
 local SCREEN_WIDTH = 320
 local SCREEN_HEIGHT = 200
-local FRAMEBUFFER_ADDR = 6632176 -- 320x200 palette-indexed framebuffer
+local FRAMEBUFFER_ADDR = 6632176 -- pointer to 320x200 palette-indexed framebuffer (stores a u32 pointer, not the data itself)
 local PALETTE_ADDR = 5277180 -- 256 RGBA entries (4 bytes each)
+local GAMMA_ADDR = 6375408 -- 5 gamma tables (256 bytes each, palette_num 0-4)
+local PALETTE_NUM_ADDR = 6632196 -- current gamma/palette number (0-4)
 local WASM_PAGE_SIZE = 65536
 
 -- Pre-allocate the pixel buffer (320*200*4 = 256000 bytes)
 local pixelBuffer = buffer.create(SCREEN_WIDTH * SCREEN_HEIGHT * 4)
+
+-- ========== OPTIMIZED RENDERING: PALETTE CACHE ==========
+-- Cache the 256-entry RGBA palette as a Lua table for fast lookup.
+-- Updated by our replacement I_SetPalette, read by our replacement I_FinishUpdate.
+-- This avoids going through WASM rt_load/rt_store wrappers for every pixel.
+local paletteCache = table.create(256)
+for i = 0, 255 do
+	paletteCache[i] = 0xFF000000 -- default: opaque black
+end
+
+-- Pre-compute destination row offset table to avoid multiplication in the hot loop
+local dstRowOffsets = table.create(SCREEN_HEIGHT)
+for y = 0, SCREEN_HEIGHT - 1 do
+	dstRowOffsets[y] = y * SCREEN_WIDTH * 4
+end
 
 -- Create the display UI
 local player = Players.LocalPlayer
@@ -291,41 +309,100 @@ local maxPages = 512
 local memoryData = buffer.create(memoryPages * WASM_PAGE_SIZE)
 local memory = { data = memoryData, max = maxPages }
 
--- Reference to WASM memory for js_draw_screen
+-- Reference to WASM memory for native rendering
 local wasmMemory = memory
 
--- js_draw_screen implementation using EditableImage + WritePixelsBuffer
--- I_FinishUpdate already converts the palette-indexed framebuffer to RGBA
--- and writes it to the address passed as the argument.
--- Layout: pixel (x,y) RGBA is a 32-bit LE value at addr + y*5120 + x*8
-local function js_draw_screen(addr)
+-- ========== OPTIMIZED RENDERING: NATIVE I_FinishUpdate ==========
+-- Replaces the WASM I_FinishUpdate + js_draw_screen pipeline with a single
+-- native Luau function that:
+--   1. Reads the palette-indexed framebuffer directly from WASM memory
+--   2. Looks up RGBA from the cached palette table (Lua table, faster than buffer reads)
+--   3. Writes directly to pixelBuffer (tight 1280-byte stride, no intermediate buffer)
+--   4. Calls WritePixelsBuffer once
+--
+-- This eliminates:
+--   - 64,000 WASM rt_load_i32_u8 calls for palette index lookup
+--   - 64,000 WASM rt_load_i32 calls for RGBA palette lookup
+--   - 256,000 WASM rt_store_i32 calls to the intermediate 5120-stride buffer
+--   - 64,000 buffer.readu32 calls in js_draw_screen for stride compaction
+--   - 64,000 buffer.writeu32 calls in js_draw_screen for pixel compaction
+--   - The entire 1,024,000-byte intermediate buffer write/read cycle
+
+local function nativeFinishUpdate()
 	if not editableImage then return end
 
 	local mem = wasmMemory.data
 	local pxBuf = pixelBuffer
+	local pal = paletteCache
+
+	-- Read the framebuffer pointer from WASM memory.
+	-- Address 6632176 stores a POINTER to the palette-indexed framebuffer,
+	-- not the data itself (the WASM I_FinishUpdate does rt_load_i32 at this addr).
+	local fbPtr = buffer.readu32(mem, FRAMEBUFFER_ADDR)
 
 	for y = 0, SCREEN_HEIGHT - 1 do
-		local srcRow = addr + y * 5120
-		local dstRow = y * 1280
+		local srcBase = fbPtr + y * SCREEN_WIDTH
+		local dstBase = dstRowOffsets[y]
 
-		-- Unrolled: process 8 pixels per iteration (320 / 8 = 40, no remainder)
+		-- Process 320 pixels per row, unrolled 8x to reduce loop overhead
 		local x = 0
 		while x < 320 do
-			local si = srcRow + x * 8
-			local di = dstRow + x * 4
-			buffer.writeu32(pxBuf, di,      buffer.readu32(mem, si))
-			buffer.writeu32(pxBuf, di + 4,  buffer.readu32(mem, si + 8))
-			buffer.writeu32(pxBuf, di + 8,  buffer.readu32(mem, si + 16))
-			buffer.writeu32(pxBuf, di + 12, buffer.readu32(mem, si + 24))
-			buffer.writeu32(pxBuf, di + 16, buffer.readu32(mem, si + 32))
-			buffer.writeu32(pxBuf, di + 20, buffer.readu32(mem, si + 40))
-			buffer.writeu32(pxBuf, di + 24, buffer.readu32(mem, si + 48))
-			buffer.writeu32(pxBuf, di + 28, buffer.readu32(mem, si + 56))
+			buffer.writeu32(pxBuf, dstBase + x * 4,     pal[buffer.readu8(mem, srcBase + x)])
+			buffer.writeu32(pxBuf, dstBase + x * 4 + 4,  pal[buffer.readu8(mem, srcBase + x + 1)])
+			buffer.writeu32(pxBuf, dstBase + x * 4 + 8,  pal[buffer.readu8(mem, srcBase + x + 2)])
+			buffer.writeu32(pxBuf, dstBase + x * 4 + 12, pal[buffer.readu8(mem, srcBase + x + 3)])
+			buffer.writeu32(pxBuf, dstBase + x * 4 + 16, pal[buffer.readu8(mem, srcBase + x + 4)])
+			buffer.writeu32(pxBuf, dstBase + x * 4 + 20, pal[buffer.readu8(mem, srcBase + x + 5)])
+			buffer.writeu32(pxBuf, dstBase + x * 4 + 24, pal[buffer.readu8(mem, srcBase + x + 6)])
+			buffer.writeu32(pxBuf, dstBase + x * 4 + 28, pal[buffer.readu8(mem, srcBase + x + 7)])
 			x = x + 8
 		end
 	end
 
 	editableImage:WritePixelsBuffer(Vector2.new(0, 0), Vector2.new(SCREEN_WIDTH, SCREEN_HEIGHT), pxBuf)
+end
+
+-- ========== OPTIMIZED RENDERING: NATIVE I_SetPalette ==========
+-- Replaces the WASM I_SetPalette with a native Luau function that:
+--   1. Reads the 768-byte RGB palette from WASM memory (3 bytes per entry)
+--   2. Converts to 256 RGBA u32 values and stores in paletteCache
+--   3. Also writes to the WASM palette at 5277180 for consistency
+--
+-- This avoids the complex WASM control flow and rt_load/rt_store wrappers.
+-- I_SetPalette is called rarely (only on palette changes like pain/pickup flashes),
+-- so this isn't a hot path, but keeping it native ensures no WASM overhead.
+
+local function nativeSetPalette(palettePtr)
+	local mem = wasmMemory.data
+	local pal = paletteCache
+
+	-- Read the current gamma/palette number (0-4)
+	local paletteNum = buffer.readu32(mem, PALETTE_NUM_ADDR)
+	if paletteNum > 4 then paletteNum = 0 end
+
+	-- Gamma table base address for the current palette number
+	local gammaBase = GAMMA_ADDR + paletteNum * 256
+
+	-- DOOM palette: 768 bytes = 256 entries * 3 bytes (R, G, B)
+	-- Convert to RGBA u32 values with gamma correction applied
+	for i = 0, 255 do
+		local r = buffer.readu8(mem, palettePtr + i * 3)
+		local g = buffer.readu8(mem, palettePtr + i * 3 + 1)
+		local b = buffer.readu8(mem, palettePtr + i * 3 + 2)
+
+		-- Apply gamma correction lookup
+		local gr = buffer.readu8(mem, gammaBase + r)
+		local gg = buffer.readu8(mem, gammaBase + g)
+		local gb = buffer.readu8(mem, gammaBase + b)
+
+		-- RGBA as little-endian u32: R | (G << 8) | (B << 16) | (0xFF << 24)
+		local rgba = gr + gg * 256 + gb * 65536 + 0xFF000000
+		pal[i] = rgba
+
+		-- Also write to WASM palette memory at 5277180 for consistency
+		-- (in case any WASM code reads it directly)
+		buffer.writeu32(mem, PALETTE_ADDR + i * 4, rgba)
+	end
 end
 
 -- DOOM event type constants (from the WASM source port's JavaScript)
@@ -440,27 +517,7 @@ local keyMap = {
 local pendingEvents = {}
 local inputState = {}
 
--- Mouse state
-local mouseDeltaX = 0
-local mouseDeltaY = 0
-local mouseTurnDir = 0  -- 0=none, 1=right, -1=left
-local mouseTurnTics = 0
-local MOUSE_SENSITIVITY = 3 -- pixels of delta per tic of turning
-UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
 
--- Mouse button DOOM key mapping
-local mouseButtonDoomKey = {
-	[Enum.UserInputType.MouseButton1] = KEY_RCTRL,  -- Left click = fire
-	[Enum.UserInputType.MouseButton2] = 32,          -- Right click = use/open
-	[Enum.UserInputType.MouseButton3] = KEY_RALT,   -- Middle click = strafe
-}
-
-UserInputService.InputChanged:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseMovement then
-		mouseDeltaX = mouseDeltaX + input.Delta.X
-		mouseDeltaY = mouseDeltaY + input.Delta.Y
-	end
-end)
 
 UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	if gameProcessed then return end
@@ -471,12 +528,7 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		table.insert(pendingEvents, { type = EV_KEYDOWN, key = doomKey })
 		return
 	end
-	-- Mouse buttons
-	local mKey = mouseButtonDoomKey[input.UserInputType]
-	if mKey then
-		inputState[mKey] = true
-		table.insert(pendingEvents, { type = EV_KEYDOWN, key = mKey })
-	end
+
 end)
 
 UserInputService.InputEnded:Connect(function(input, gameProcessed)
@@ -487,11 +539,7 @@ UserInputService.InputEnded:Connect(function(input, gameProcessed)
 		table.insert(pendingEvents, { type = EV_KEYUP, key = doomKey })
 		return
 	end
-	local mKey = mouseButtonDoomKey[input.UserInputType]
-	if mKey then
-		inputState[mKey] = false
-		table.insert(pendingEvents, { type = EV_KEYUP, key = mKey })
-	end
+
 end)
 
 -- Set up the WASM environment
@@ -504,7 +552,7 @@ local wasm = {
 			["js_console_log"] = function(msg)
 				print("[DOOM]", msg)
 			end,
-			["js_draw_screen"] = js_draw_screen,
+			["js_draw_screen"] = function() end, -- no-op: native I_FinishUpdate handles rendering directly
 			["js_stdout"] = function(msg)
 				print("[DOOM stdout]", msg)
 			end,
@@ -528,180 +576,13 @@ wasm_div_f64 = function(lhs, rhs)
 	return lhs / rhs
 end
 
--- ========== WAD Boot System ==========
-local doomRunning = false
-local customWadBuffer = nil
-local customWadSize = 0
-local CUSTOM_FD_BASE = 1000
-local customOpenFiles = {}
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-
-local function readWasmString(addr)
-	local mem = wasmMemory.data
-	local chars = {}
-	local offset = addr
-	for _ = 1, 512 do
-		local b = buffer.readu8(mem, offset)
-		if b == 0 then break end
-		table.insert(chars, string.char(b))
-		offset = offset + 1
-	end
-	return table.concat(chars)
-end
-
-local function isWadPath(path)
-	return path:lower():sub(-4) == ".wad"
-end
-
-local function hookFilesystem(doom)
-	if not customWadBuffer then return end
-	local origOpen = doom.func_list["open"]
-	local origRead = doom.func_list["read"]
-	local origLseek = doom.func_list["lseek"]
-	local origClose = doom.func_list["close"]
-	local origAccess = doom.func_list["access"]
-	local origFstat = doom.func_list["fstat"]
-	local nextFd = CUSTOM_FD_BASE
-
-	doom.func_list["open"] = function(pathPtr, flags, mode)
-		local path = readWasmString(pathPtr)
-		if isWadPath(path) then
-			local fd = nextFd
-			nextFd = nextFd + 1
-			customOpenFiles[fd] = {pos = 0}
-			print("[WAD] Opened custom WAD as fd", fd, "path:", path)
-			return fd
-		end
-		return origOpen(pathPtr, flags, mode)
-	end
-
-	doom.func_list["read"] = function(fd, bufPtr, count)
-		local file = customOpenFiles[fd]
-		if file then
-			local remaining = customWadSize - file.pos
-			local toRead = math.min(count, remaining)
-			if toRead > 0 then
-				buffer.copy(wasmMemory.data, bufPtr, customWadBuffer, file.pos, toRead)
-				file.pos = file.pos + toRead
-			end
-			return toRead
-		end
-		return origRead(fd, bufPtr, count)
-	end
-
-	doom.func_list["lseek"] = function(fd, offset, whence)
-		local file = customOpenFiles[fd]
-		if file then
-			if whence == 0 then file.pos = offset
-			elseif whence == 1 then file.pos = file.pos + offset
-			elseif whence == 2 then file.pos = customWadSize + offset
-			end
-			file.pos = math.clamp(file.pos, 0, customWadSize)
-			return file.pos
-		end
-		return origLseek(fd, offset, whence)
-	end
-
-	doom.func_list["close"] = function(fd)
-		if customOpenFiles[fd] then
-			customOpenFiles[fd] = nil
-			return 0
-		end
-		return origClose(fd)
-	end
-
-	doom.func_list["access"] = function(pathPtr, mode)
-		local path = readWasmString(pathPtr)
-		if isWadPath(path) then return 0 end
-		return origAccess(pathPtr, mode)
-	end
-
-	doom.func_list["fstat"] = function(fd, statPtr)
-		local file = customOpenFiles[fd]
-		if file then
-			for i = 0, 143 do
-				buffer.writeu8(wasmMemory.data, statPtr + i, 0)
-			end
-			buffer.writeu16(wasmMemory.data, statPtr + 24, 0x8124)
-			buffer.writeu32(wasmMemory.data, statPtr + 60, customWadSize)
-			return 0
-		end
-		return origFstat(fd, statPtr)
-	end
-
-	print("[WAD] Filesystem hooks installed")
-end
-
-local function setupChatHandler()
-	local player = Players.LocalPlayer
-	player.Chatted:Connect(function(message)
-		local msg = message:match("^!bootwad%s+(.+)$")
-		if msg then
-			print("[WAD] Boot WAD command received, URL:", msg)
-			local DownloadWad = ReplicatedStorage:FindFirstChild("DownloadWad")
-			if DownloadWad then
-				DownloadWad:FireServer(msg)
-			else
-				warn("[WAD] DownloadWad RemoteEvent not found")
-			end
-		end
-	end)
-end
-
-local function setupWadReceiver()
-	local WadChunk = ReplicatedStorage:WaitForChild("WadChunk")
-	local WadReady = ReplicatedStorage:WaitForChild("WadReady")
-	local chunks = {}
-	local totalChunks = 0
-
-	WadChunk.OnClientEvent:Connect(function(chunkIndex, numChunks, data)
-		if chunkIndex == -1 then
-			warn("[WAD] Download error:", data)
-			chunks = {}
-			return
-		end
-		totalChunks = numChunks
-		chunks[chunkIndex] = data
-	end)
-
-	WadReady.OnClientEvent:Connect(function(wadSize)
-		if totalChunks == 0 or #chunks == 0 then
-			warn("[WAD] No chunks received")
-			return
-		end
-		local wadString = {}
-		for i = 0, totalChunks - 1 do
-			if chunks[i] then
-				table.insert(wadString, chunks[i])
-			else
-				warn("[WAD] Missing chunk", i)
-				return
-			end
-		end
-		local fullData = table.concat(wadString)
-		chunks = {}
-		customWadSize = #fullData
-		customWadBuffer = buffer.create(customWadSize)
-		buffer.writestring(customWadBuffer, 0, fullData)
-		print("[WAD] Custom WAD loaded:", customWadSize, "bytes")
-		doomRunning = false
-	end)
-end
-
-setupChatHandler()
-setupWadReceiver()
 
 -- Require and initialize the DOOM module
 local DOOM = require(game.ReplicatedStorage.DOOM)
 
 local function runDoomSession()
-	-- Reset state for new session
-	customOpenFiles = {}
 	local doom = DOOM(wasm)
-
-	-- Install filesystem hooks if custom WAD is loaded
-	hookFilesystem(doom)
 
 	-- ========== SOUND INTERCEPTION HOOK ==========
 	-- Replace S_StartSound (FUNC_LIST[765]) with a wrapper that
@@ -756,6 +637,25 @@ local function runDoomSession()
 		warn("[DOOM] _FUNC_LIST not exposed — sound hooks not installed")
 	end
 
+	-- ========== OPTIMIZED RENDERING HOOKS ==========
+	-- Replace WASM I_FinishUpdate (FUNC_LIST[211]) and I_SetPalette (FUNC_LIST[210])
+	-- with native Luau implementations that bypass the slow WASM palette conversion
+	-- and intermediate buffer, writing directly to the EditableImage pixel buffer.
+	local FL = doom._FUNC_LIST
+	if FL then
+		-- I_FinishUpdate: instead of the WASM palette lookup + intermediate buffer,
+		-- our native version reads the framebuffer directly and writes to pixelBuffer.
+		FL[211] = nativeFinishUpdate
+
+		-- I_SetPalette: instead of the complex WASM control flow,
+		-- our native version reads the 768-byte RGB palette and caches it.
+		FL[210] = nativeSetPalette
+
+		print("[DOOM] Optimized rendering hooks installed (native I_FinishUpdate + I_SetPalette)")
+	else
+		warn("[DOOM] _FUNC_LIST not exposed — rendering hooks not installed")
+	end
+
 	local doomMain = doom.func_list["main"]
 	local doomLoopStep = doom.func_list["doom_loop_step"]
 	local addBrowserEvent = doom.func_list["add_browser_event"]
@@ -795,10 +695,8 @@ local function runDoomSession()
 		lastGamestate = gs
 	end
 
-	doomRunning = true
-
 	-- Game loop
-	while doomRunning do
+	while true do
 		-- Process pending input events
 		while #pendingEvents > 0 do
 			local event = table.remove(pendingEvents, 1)
@@ -809,34 +707,6 @@ local function runDoomSession()
 				if not ok2 then
 					warn("[DOOM] Input error:", err2)
 				end
-			end
-		end
-
-		-- Convert mouse delta to arrow key turning
-		if mouseDeltaX ~= 0 then
-			local tics = math.clamp(math.floor(math.abs(mouseDeltaX) / MOUSE_SENSITIVITY), 1, 12)
-			local newDir = mouseDeltaX > 0 and 1 or -1
-
-			if mouseTurnDir ~= 0 and mouseTurnDir ~= newDir and addBrowserEvent then
-				addBrowserEvent(EV_KEYUP, mouseTurnDir == 1 and KEY_RIGHTARROW or KEY_LEFTARROW)
-			end
-
-			mouseTurnDir = newDir
-			mouseTurnTics = tics
-
-			if addBrowserEvent then
-				addBrowserEvent(EV_KEYDOWN, newDir == 1 and KEY_RIGHTARROW or KEY_LEFTARROW)
-			end
-
-			mouseDeltaX = 0
-		end
-		mouseDeltaY = 0
-
-		if mouseTurnTics > 0 then
-			mouseTurnTics = mouseTurnTics - 1
-			if mouseTurnTics == 0 and mouseTurnDir ~= 0 and addBrowserEvent then
-				addBrowserEvent(EV_KEYUP, mouseTurnDir == 1 and KEY_RIGHTARROW or KEY_LEFTARROW)
-				mouseTurnDir = 0
 			end
 		end
 
@@ -858,16 +728,3 @@ end
 
 -- Start the first session
 runDoomSession()
-
--- Watch for restart requests (when custom WAD is loaded)
-while true do
-	if customWadBuffer and not doomRunning then
-		print("[WAD] Restarting DOOM with custom WAD...")
-		-- Re-create WASM memory for a clean state
-		memoryData = buffer.create(memoryPages * WASM_PAGE_SIZE)
-		memory.data = memoryData
-		wasmMemory = memory
-		runDoomSession()
-	end
-	task.wait(0.5)
-end
